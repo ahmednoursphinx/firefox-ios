@@ -39,6 +39,52 @@ fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
     }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
 }
 
 // For every type used in the interface, we provide helper methods for conveniently
@@ -493,7 +539,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -509,7 +559,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -602,18 +653,20 @@ open class EncryptorDecryptorImpl: EncryptorDecryptor, @unchecked Sendable {
     
 open func decrypt(ciphertext: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_encryptordecryptor_decrypt(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(ciphertext),$0
+        FfiConverterData.lower(ciphertext),uniffiCallStatus
     )
 })
 }
     
 open func encrypt(cleartext: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_encryptordecryptor_encrypt(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(cleartext),$0
+        FfiConverterData.lower(cleartext),uniffiCallStatus
     )
 })
 }
@@ -630,9 +683,8 @@ fileprivate struct UniffiCallbackInterfaceEncryptorDecryptor {
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
-    // This creates 1-element array, since this seems to be the only way to construct a const
-    // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceEncryptorDecryptor] = [UniffiVTableCallbackInterfaceEncryptorDecryptor(
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceEncryptorDecryptor = UniffiVTableCallbackInterfaceEncryptorDecryptor(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
                 try FfiConverterTypeEncryptorDecryptor.handleMap.remove(handle: uniffiHandle)
@@ -697,11 +749,23 @@ fileprivate struct UniffiCallbackInterfaceEncryptorDecryptor {
                 lowerError: FfiConverterTypeLoginsApiError_lower
             )
         }
-    )]
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceEncryptorDecryptor> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceEncryptorDecryptor>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
 }
 
 private func uniffiCallbackInitEncryptorDecryptor() {
-    uniffi_logins_fn_init_callback_vtable_encryptordecryptor(UniffiCallbackInterfaceEncryptorDecryptor.vtable)
+    uniffi_logins_fn_init_callback_vtable_encryptordecryptor(UniffiCallbackInterfaceEncryptorDecryptor.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -824,8 +888,9 @@ open class KeyManagerImpl: KeyManager, @unchecked Sendable {
     
 open func getKey()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_keymanager_get_key(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -842,9 +907,8 @@ fileprivate struct UniffiCallbackInterfaceKeyManager {
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
-    // This creates 1-element array, since this seems to be the only way to construct a const
-    // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceKeyManager] = [UniffiVTableCallbackInterfaceKeyManager(
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceKeyManager = UniffiVTableCallbackInterfaceKeyManager(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
                 try FfiConverterTypeKeyManager.handleMap.remove(handle: uniffiHandle)
@@ -882,11 +946,23 @@ fileprivate struct UniffiCallbackInterfaceKeyManager {
                 lowerError: FfiConverterTypeLoginsApiError_lower
             )
         }
-    )]
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceKeyManager> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceKeyManager>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
 }
 
 private func uniffiCallbackInitKeyManager() {
-    uniffi_logins_fn_init_callback_vtable_keymanager(UniffiCallbackInterfaceKeyManager.vtable)
+    uniffi_logins_fn_init_callback_vtable_keymanager(UniffiCallbackInterfaceKeyManager.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -985,6 +1061,17 @@ public protocol LoginStoreProtocol: AnyObject, Sendable {
     
     func delete(id: String) throws  -> Bool
     
+    /**
+     * Delete all logins. Returns the ids of the deleted logins.
+     */
+    func deleteAll() throws  -> [String]
+    
+    /**
+     * Delete all logins except the FxA session-credentials login. Returns the
+     * ids of the deleted logins.
+     */
+    func deleteAllExceptFxa() throws  -> [String]
+    
     func deleteMany(ids: [String]) throws  -> [Bool]
     
     /**
@@ -1003,6 +1090,12 @@ public protocol LoginStoreProtocol: AnyObject, Sendable {
     
     func getByBaseDomain(baseDomain: String) throws  -> [Login]
     
+    /**
+     * Get and decrypt the logins with the given ids. Ids which don't exist are skipped, as are
+     * logins which fail to decrypt.
+     */
+    func getMany(ids: [String]) throws  -> [Login]
+    
     func hasLoginsByBaseDomain(baseDomain: String) throws  -> Bool
     
     func isEmpty() throws  -> Bool
@@ -1017,6 +1110,12 @@ public protocol LoginStoreProtocol: AnyObject, Sendable {
     func isPotentiallyVulnerablePassword(id: String) throws  -> Bool
     
     func list() throws  -> [Login]
+    
+    /**
+     * Like `list()`, but without the encrypted fields - and so without needing the encryption
+     * key. Resolve the ids you're interested in with `get_many()`.
+     */
+    func listCandidates() throws  -> [LoginCandidate]
     
     /**
      * Stores that the user dismissed the breach alert for a login.
@@ -1075,6 +1174,11 @@ public protocol LoginStoreProtocol: AnyObject, Sendable {
      */
     func wipeLocal() throws 
     
+    /**
+     * Like `wipe_local`, but preserves the FxA session-credentials login.
+     */
+    func wipeLocalExceptFxa() throws 
+    
 }
 open class LoginStore: LoginStoreProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -1118,9 +1222,10 @@ open class LoginStore: LoginStoreProtocol, @unchecked Sendable {
 public convenience init(path: String, encdec: EncryptorDecryptor)throws  {
     let handle =
         try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_constructor_loginstore_new(
         FfiConverterString.lower(path),
-        FfiConverterTypeEncryptorDecryptor_lower(encdec),$0
+        FfiConverterTypeEncryptorDecryptor_lower(encdec),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -1140,45 +1245,50 @@ public convenience init(path: String, encdec: EncryptorDecryptor)throws  {
     
 open func add(login: LoginEntry)throws  -> Login  {
     return try  FfiConverterTypeLogin_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_add(
             self.uniffiCloneHandle(),
-        FfiConverterTypeLoginEntry_lower(login),$0
+        FfiConverterTypeLoginEntry_lower(login),uniffiCallStatus
     )
 })
 }
     
 open func addMany(logins: [LoginEntry])throws  -> [BulkResultEntry]  {
     return try  FfiConverterSequenceTypeBulkResultEntry.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_add_many(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeLoginEntry.lower(logins),$0
+        FfiConverterSequenceTypeLoginEntry.lower(logins),uniffiCallStatus
     )
 })
 }
     
 open func addManyWithMeta(entriesWithMeta: [LoginEntryWithMeta])throws  -> [BulkResultEntry]  {
     return try  FfiConverterSequenceTypeBulkResultEntry.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_add_many_with_meta(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeLoginEntryWithMeta.lower(entriesWithMeta),$0
+        FfiConverterSequenceTypeLoginEntryWithMeta.lower(entriesWithMeta),uniffiCallStatus
     )
 })
 }
     
 open func addOrUpdate(login: LoginEntry)throws  -> Login  {
     return try  FfiConverterTypeLogin_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_add_or_update(
             self.uniffiCloneHandle(),
-        FfiConverterTypeLoginEntry_lower(login),$0
+        FfiConverterTypeLoginEntry_lower(login),uniffiCallStatus
     )
 })
 }
     
 open func addWithMeta(entryWithMeta: LoginEntryWithMeta)throws  -> Login  {
     return try  FfiConverterTypeLogin_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_add_with_meta(
             self.uniffiCloneHandle(),
-        FfiConverterTypeLoginEntryWithMeta_lower(entryWithMeta),$0
+        FfiConverterTypeLoginEntryWithMeta_lower(entryWithMeta),uniffiCallStatus
     )
 })
 }
@@ -1192,9 +1302,10 @@ open func addWithMeta(entryWithMeta: LoginEntryWithMeta)throws  -> Login  {
      */
 open func arePotentiallyVulnerablePasswords(ids: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_are_potentially_vulnerable_passwords(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceString.lower(ids),$0
+        FfiConverterSequenceString.lower(ids),uniffiCallStatus
     )
 })
 }
@@ -1206,52 +1317,83 @@ open func arePotentiallyVulnerablePasswords(ids: [String])throws  -> [String]  {
      */
 open func bridgedEngine()throws  -> LoginsBridgedEngine  {
     return try  FfiConverterTypeLoginsBridgedEngine_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_bridged_engine(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func count()throws  -> Int64  {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_count(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func countByFormActionOrigin(formActionOrigin: String)throws  -> Int64  {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_count_by_form_action_origin(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(formActionOrigin),$0
+        FfiConverterString.lower(formActionOrigin),uniffiCallStatus
     )
 })
 }
     
 open func countByOrigin(origin: String)throws  -> Int64  {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_count_by_origin(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(origin),$0
+        FfiConverterString.lower(origin),uniffiCallStatus
     )
 })
 }
     
 open func delete(id: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_delete(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
+        FfiConverterString.lower(id),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Delete all logins. Returns the ids of the deleted logins.
+     */
+open func deleteAll()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginstore_delete_all(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Delete all logins except the FxA session-credentials login. Returns the
+     * ids of the deleted logins.
+     */
+open func deleteAllExceptFxa()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginstore_delete_all_except_fxa(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func deleteMany(ids: [String])throws  -> [Bool]  {
     return try  FfiConverterSequenceBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_delete_many(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceString.lower(ids),$0
+        FfiConverterSequenceString.lower(ids),uniffiCallStatus
     )
 })
 }
@@ -1266,52 +1408,72 @@ open func deleteMany(ids: [String])throws  -> [Bool]  {
      */
 open func deleteUndecryptableRecordsForRemoteReplacement()throws  -> LoginsDeletionMetrics  {
     return try  FfiConverterTypeLoginsDeletionMetrics_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_delete_undecryptable_records_for_remote_replacement(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func findLoginToUpdate(look: LoginEntry)throws  -> Login?  {
     return try  FfiConverterOptionTypeLogin.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_find_login_to_update(
             self.uniffiCloneHandle(),
-        FfiConverterTypeLoginEntry_lower(look),$0
+        FfiConverterTypeLoginEntry_lower(look),uniffiCallStatus
     )
 })
 }
     
 open func get(id: String)throws  -> Login?  {
     return try  FfiConverterOptionTypeLogin.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_get(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
+        FfiConverterString.lower(id),uniffiCallStatus
     )
 })
 }
     
 open func getByBaseDomain(baseDomain: String)throws  -> [Login]  {
     return try  FfiConverterSequenceTypeLogin.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_get_by_base_domain(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(baseDomain),$0
+        FfiConverterString.lower(baseDomain),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Get and decrypt the logins with the given ids. Ids which don't exist are skipped, as are
+     * logins which fail to decrypt.
+     */
+open func getMany(ids: [String])throws  -> [Login]  {
+    return try  FfiConverterSequenceTypeLogin.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginstore_get_many(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(ids),uniffiCallStatus
     )
 })
 }
     
 open func hasLoginsByBaseDomain(baseDomain: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_has_logins_by_base_domain(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(baseDomain),$0
+        FfiConverterString.lower(baseDomain),uniffiCallStatus
     )
 })
 }
     
 open func isEmpty()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_is_empty(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1325,17 +1487,32 @@ open func isEmpty()throws  -> Bool  {
      */
 open func isPotentiallyVulnerablePassword(id: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_is_potentially_vulnerable_password(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
+        FfiConverterString.lower(id),uniffiCallStatus
     )
 })
 }
     
 open func list()throws  -> [Login]  {
     return try  FfiConverterSequenceTypeLogin.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_list(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Like `list()`, but without the encrypted fields - and so without needing the encryption
+     * key. Resolve the ids you're interested in with `get_many()`.
+     */
+open func listCandidates()throws  -> [LoginCandidate]  {
+    return try  FfiConverterSequenceTypeLoginCandidate.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginstore_list_candidates(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1344,9 +1521,10 @@ open func list()throws  -> [Login]  {
      * Stores that the user dismissed the breach alert for a login.
      */
 open func recordBreachAlertDismissal(id: String)throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_record_breach_alert_dismissal(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
+        FfiConverterString.lower(id),uniffiCallStatus
     )
 }
 }
@@ -1355,10 +1533,11 @@ open func recordBreachAlertDismissal(id: String)throws   {try rustCallWithError(
      * Stores the time at which the user dismissed the breach alert for a login.
      */
 open func recordBreachAlertDismissalTime(id: String, timestamp: Int64)throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_record_breach_alert_dismissal_time(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),
-        FfiConverterInt64.lower(timestamp),$0
+        FfiConverterInt64.lower(timestamp),uniffiCallStatus
     )
 }
 }
@@ -1371,23 +1550,26 @@ open func recordBreachAlertDismissalTime(id: String, timestamp: Int64)throws   {
      * Passwords are encrypted before storage and duplicates are automatically filtered out.
      */
 open func recordPotentiallyVulnerablePasswords(passwords: [String])throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_record_potentially_vulnerable_passwords(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceString.lower(passwords),$0
+        FfiConverterSequenceString.lower(passwords),uniffiCallStatus
     )
 }
 }
     
 open func registerWithSyncManager()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_register_with_sync_manager(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
     
 open func reset()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1396,8 +1578,9 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_
      * Removes all recorded breaches.
      */
 open func resetAllBreaches()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_reset_all_breaches(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1409,34 +1592,38 @@ open func resetAllBreaches()throws   {try rustCallWithError(FfiConverterTypeLogi
      * database.
      */
 open func runMaintenance(options: RunMaintenanceOptions? = nil)throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_run_maintenance(
             self.uniffiCloneHandle(),
-        FfiConverterOptionTypeRunMaintenanceOptions.lower(options),$0
+        FfiConverterOptionTypeRunMaintenanceOptions.lower(options),uniffiCallStatus
     )
 }
 }
     
 open func shutdown()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_shutdown(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
     
 open func touch(id: String)throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_touch(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
+        FfiConverterString.lower(id),uniffiCallStatus
     )
 }
 }
     
 open func update(id: String, login: LoginEntry)throws  -> Login  {
     return try  FfiConverterTypeLogin_lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_update(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),
-        FfiConverterTypeLoginEntry_lower(login),$0
+        FfiConverterTypeLoginEntry_lower(login),uniffiCallStatus
     )
 })
 }
@@ -1455,8 +1642,20 @@ open func update(id: String, login: LoginEntry)throws  -> Login  {
      * generated.
      */
 open func wipeLocal()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginstore_wipe_local(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Like `wipe_local`, but preserves the FxA session-credentials login.
+     */
+open func wipeLocalExceptFxa()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginstore_wipe_local_except_fxa(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1512,14 +1711,15 @@ public func FfiConverterTypeLoginStore_lower(_ value: LoginStore) -> UInt64 {
 
 
 /**
- * The Desktop-facing bridged sync engine. The canonical docs are in
- * https://searchfox.org/mozilla-central/source/services/interfaces/mozIBridgedSyncEngine.idl
+ * The Desktop-facing bridged sync engine - a thin wrapper over the
+ * `sync15::engine::SyncEngine` implemented by this component (see
+ * `sync15::engine::BridgedEngineWrapper`).
  * It's only actually used on Desktop, but it's fine to expose this everywhere.
  * NOTE: all timestamps here are milliseconds.
  */
 public protocol LoginsBridgedEngineProtocol: AnyObject, Sendable {
     
-    func apply() throws  -> [String]
+    func apply(serverModifiedMillis: Int64) throws  -> [String]
     
     func ensureCurrentSyncId(newSyncId: String) throws  -> String
     
@@ -1527,9 +1727,9 @@ public protocol LoginsBridgedEngineProtocol: AnyObject, Sendable {
     
     func reset() throws 
     
-    func resetSyncId() throws  -> String
+    func resetLastSync() throws 
     
-    func setLastSync(lastSync: Int64) throws 
+    func resetSyncId() throws  -> String
     
     func setUploaded(newTimestamp: Int64, uploadedIds: [String]) throws 
     
@@ -1545,8 +1745,9 @@ public protocol LoginsBridgedEngineProtocol: AnyObject, Sendable {
     
 }
 /**
- * The Desktop-facing bridged sync engine. The canonical docs are in
- * https://searchfox.org/mozilla-central/source/services/interfaces/mozIBridgedSyncEngine.idl
+ * The Desktop-facing bridged sync engine - a thin wrapper over the
+ * `sync15::engine::SyncEngine` implemented by this component (see
+ * `sync15::engine::BridgedEngineWrapper`).
  * It's only actually used on Desktop, but it's fine to expose this everywhere.
  * NOTE: all timestamps here are milliseconds.
  */
@@ -1603,96 +1804,108 @@ open class LoginsBridgedEngine: LoginsBridgedEngineProtocol, @unchecked Sendable
     
 
     
-open func apply()throws  -> [String]  {
+open func apply(serverModifiedMillis: Int64)throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_apply(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(serverModifiedMillis),uniffiCallStatus
     )
 })
 }
     
 open func ensureCurrentSyncId(newSyncId: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_ensure_current_sync_id(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(newSyncId),$0
+        FfiConverterString.lower(newSyncId),uniffiCallStatus
     )
 })
 }
     
 open func lastSync()throws  -> Int64  {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_last_sync(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func reset()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+open func resetLastSync()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
+    uniffi_logins_fn_method_loginsbridgedengine_reset_last_sync(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
     
 open func resetSyncId()throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_reset_sync_id(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
-open func setLastSync(lastSync: Int64)throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
-    uniffi_logins_fn_method_loginsbridgedengine_set_last_sync(
-            self.uniffiCloneHandle(),
-        FfiConverterInt64.lower(lastSync),$0
-    )
-}
-}
-    
 open func setUploaded(newTimestamp: Int64, uploadedIds: [String])throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_set_uploaded(
             self.uniffiCloneHandle(),
         FfiConverterInt64.lower(newTimestamp),
-        FfiConverterSequenceString.lower(uploadedIds),$0
+        FfiConverterSequenceString.lower(uploadedIds),uniffiCallStatus
     )
 }
 }
     
 open func storeIncoming(incomingEnvelopesAsJson: [String])throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_store_incoming(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceString.lower(incomingEnvelopesAsJson),$0
+        FfiConverterSequenceString.lower(incomingEnvelopesAsJson),uniffiCallStatus
     )
 }
 }
     
 open func syncFinished()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_sync_finished(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
     
 open func syncId()throws  -> String?  {
     return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_sync_id(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 open func syncStarted()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_sync_started(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
     
 open func wipe()throws   {try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_method_loginsbridgedengine_wipe(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1792,8 +2005,9 @@ open class ManagedEncryptorDecryptor: ManagedEncryptorDecryptorProtocol, @unchec
 public convenience init(keyManager: KeyManager) {
     let handle =
         try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_constructor_managedencryptordecryptor_new(
-        FfiConverterTypeKeyManager_lower(keyManager),$0
+        FfiConverterTypeKeyManager_lower(keyManager),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -1906,8 +2120,9 @@ open class StaticKeyManager: StaticKeyManagerProtocol, @unchecked Sendable {
 public convenience init(key: String) {
     let handle =
         try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_constructor_statickeymanager_new(
-        FfiConverterString.lower(key),$0
+        FfiConverterString.lower(key),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -2071,6 +2286,102 @@ public func FfiConverterTypeLogin_lift(_ buf: RustBuffer) throws -> Login {
 #endif
 public func FfiConverterTypeLogin_lower(_ value: Login) -> RustBuffer {
     return FfiConverterTypeLogin.lower(value)
+}
+
+
+/**
+ * A login stored in the database, minus the encrypted fields.
+ *
+ * Reading these never needs the encryption key, so consumers which filter on the cleartext
+ * fields can do so without forcing the user to authenticate. See `list_candidates()`.
+ */
+public struct LoginCandidate: Equatable, Hashable {
+    public var id: String
+    public var timesUsed: Int64
+    public var timeCreated: Int64
+    public var timeLastUsed: Int64
+    public var timePasswordChanged: Int64
+    public var timeLastBreachAlertDismissed: Int64?
+    public var origin: String
+    public var httpRealm: String?
+    public var formActionOrigin: String?
+    public var usernameField: String
+    public var passwordField: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, timesUsed: Int64, timeCreated: Int64, timeLastUsed: Int64, timePasswordChanged: Int64, timeLastBreachAlertDismissed: Int64?, origin: String, httpRealm: String?, formActionOrigin: String?, usernameField: String, passwordField: String) {
+        self.id = id
+        self.timesUsed = timesUsed
+        self.timeCreated = timeCreated
+        self.timeLastUsed = timeLastUsed
+        self.timePasswordChanged = timePasswordChanged
+        self.timeLastBreachAlertDismissed = timeLastBreachAlertDismissed
+        self.origin = origin
+        self.httpRealm = httpRealm
+        self.formActionOrigin = formActionOrigin
+        self.usernameField = usernameField
+        self.passwordField = passwordField
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LoginCandidate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoginCandidate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoginCandidate {
+        return
+            try LoginCandidate(
+                id: FfiConverterString.read(from: &buf), 
+                timesUsed: FfiConverterInt64.read(from: &buf), 
+                timeCreated: FfiConverterInt64.read(from: &buf), 
+                timeLastUsed: FfiConverterInt64.read(from: &buf), 
+                timePasswordChanged: FfiConverterInt64.read(from: &buf), 
+                timeLastBreachAlertDismissed: FfiConverterOptionInt64.read(from: &buf), 
+                origin: FfiConverterString.read(from: &buf), 
+                httpRealm: FfiConverterOptionString.read(from: &buf), 
+                formActionOrigin: FfiConverterOptionString.read(from: &buf), 
+                usernameField: FfiConverterString.read(from: &buf), 
+                passwordField: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LoginCandidate, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterInt64.write(value.timesUsed, into: &buf)
+        FfiConverterInt64.write(value.timeCreated, into: &buf)
+        FfiConverterInt64.write(value.timeLastUsed, into: &buf)
+        FfiConverterInt64.write(value.timePasswordChanged, into: &buf)
+        FfiConverterOptionInt64.write(value.timeLastBreachAlertDismissed, into: &buf)
+        FfiConverterString.write(value.origin, into: &buf)
+        FfiConverterOptionString.write(value.httpRealm, into: &buf)
+        FfiConverterOptionString.write(value.formActionOrigin, into: &buf)
+        FfiConverterString.write(value.usernameField, into: &buf)
+        FfiConverterString.write(value.passwordField, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginCandidate_lift(_ buf: RustBuffer) throws -> LoginCandidate {
+    return try FfiConverterTypeLoginCandidate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginCandidate_lower(_ value: LoginCandidate) -> RustBuffer {
+    return FfiConverterTypeLoginCandidate.lower(value)
 }
 
 
@@ -2392,8 +2703,7 @@ public func FfiConverterTypeRunMaintenanceOptions_lower(_ value: RunMaintenanceO
     return FfiConverterTypeRunMaintenanceOptions.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * A bulk insert result entry, returned by `add_many` and `add_many_with_meta`
  */
@@ -2468,8 +2778,7 @@ public func FfiConverterTypeBulkResultEntry_lower(_ value: BulkResultEntry) -> R
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 
 public enum LoginOrErrorMessage: Equatable, Hashable {
     
@@ -2539,7 +2848,8 @@ public func FfiConverterTypeLoginOrErrorMessage_lower(_ value: LoginOrErrorMessa
 /**
  * These are the errors returned by our public API.
  */
-public enum LoginsApiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+public 
+enum LoginsApiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -2919,6 +3229,31 @@ fileprivate struct FfiConverterSequenceTypeLogin: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeLoginCandidate: FfiConverterRustBuffer {
+    typealias SwiftType = [LoginCandidate]
+
+    public static func write(_ value: [LoginCandidate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLoginCandidate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LoginCandidate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LoginCandidate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLoginCandidate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeLoginEntry: FfiConverterRustBuffer {
     typealias SwiftType = [LoginEntry]
 
@@ -2995,10 +3330,11 @@ fileprivate struct FfiConverterSequenceTypeBulkResultEntry: FfiConverterRustBuff
  */
 public func checkCanary(canary: String, text: String, encryptionKey: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_func_check_canary(
         FfiConverterString.lower(canary),
         FfiConverterString.lower(text),
-        FfiConverterString.lower(encryptionKey),$0
+        FfiConverterString.lower(encryptionKey),uniffiCallStatus
     )
 })
 }
@@ -3007,9 +3343,10 @@ public func checkCanary(canary: String, text: String, encryptionKey: String)thro
  */
 public func createCanary(text: String, encryptionKey: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
+        uniffiCallStatus in
     uniffi_logins_fn_func_create_canary(
         FfiConverterString.lower(text),
-        FfiConverterString.lower(encryptionKey),$0
+        FfiConverterString.lower(encryptionKey),uniffiCallStatus
     )
 })
 }
@@ -3019,7 +3356,8 @@ public func createCanary(text: String, encryptionKey: String)throws  -> String  
  */
 public func createKey()throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeLoginsApiError_lift) {
-    uniffi_logins_fn_func_create_key($0
+        uniffiCallStatus in
+    uniffi_logins_fn_func_create_key(uniffiCallStatus
     )
 })
 }
@@ -3029,9 +3367,10 @@ public func createKey()throws  -> String  {
  */
 public func createLoginStoreWithStaticKeyManager(path: String, key: String) -> LoginStore  {
     return try!  FfiConverterTypeLoginStore_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_func_create_login_store_with_static_key_manager(
         FfiConverterString.lower(path),
-        FfiConverterString.lower(key),$0
+        FfiConverterString.lower(key),uniffiCallStatus
     )
 })
 }
@@ -3041,8 +3380,9 @@ public func createLoginStoreWithStaticKeyManager(path: String, key: String) -> L
  */
 public func createManagedEncdec(keyManager: KeyManager) -> EncryptorDecryptor  {
     return try!  FfiConverterTypeEncryptorDecryptor_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_func_create_managed_encdec(
-        FfiConverterTypeKeyManager_lower(keyManager),$0
+        FfiConverterTypeKeyManager_lower(keyManager),uniffiCallStatus
     )
 })
 }
@@ -3054,8 +3394,9 @@ public func createManagedEncdec(keyManager: KeyManager) -> EncryptorDecryptor  {
  */
 public func createStaticKeyManager(key: String) -> KeyManager  {
     return try!  FfiConverterTypeKeyManager_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_logins_fn_func_create_static_key_manager(
-        FfiConverterString.lower(key),$0
+        FfiConverterString.lower(key),uniffiCallStatus
     )
 })
 }
@@ -3087,10 +3428,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_func_create_login_store_with_static_key_manager() != 36971) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_func_create_managed_encdec() != 15704) {
+    if (uniffi_logins_checksum_func_create_managed_encdec() != 35816) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_func_create_static_key_manager() != 65197) {
+    if (uniffi_logins_checksum_func_create_static_key_manager() != 61617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_encryptordecryptor_decrypt() != 2802) {
@@ -3105,10 +3446,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_add() != 53186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_add_many() != 34214) {
+    if (uniffi_logins_checksum_method_loginstore_add_many() != 16929) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_add_many_with_meta() != 19743) {
+    if (uniffi_logins_checksum_method_loginstore_add_many_with_meta() != 49502) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_add_or_update() != 64746) {
@@ -3117,7 +3458,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_add_with_meta() != 23643) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_are_potentially_vulnerable_passwords() != 24759) {
+    if (uniffi_logins_checksum_method_loginstore_are_potentially_vulnerable_passwords() != 60305) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_bridged_engine() != 17864) {
@@ -3135,19 +3476,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_delete() != 30748) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_delete_many() != 49226) {
+    if (uniffi_logins_checksum_method_loginstore_delete_all() != 46588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_logins_checksum_method_loginstore_delete_all_except_fxa() != 2526) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_logins_checksum_method_loginstore_delete_many() != 35553) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_delete_undecryptable_records_for_remote_replacement() != 3722) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_find_login_to_update() != 26843) {
+    if (uniffi_logins_checksum_method_loginstore_find_login_to_update() != 3878) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_get() != 35908) {
+    if (uniffi_logins_checksum_method_loginstore_get() != 29117) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_get_by_base_domain() != 30272) {
+    if (uniffi_logins_checksum_method_loginstore_get_by_base_domain() != 32212) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_logins_checksum_method_loginstore_get_many() != 60255) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_has_logins_by_base_domain() != 40417) {
@@ -3159,7 +3509,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_is_potentially_vulnerable_password() != 30881) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_list() != 12147) {
+    if (uniffi_logins_checksum_method_loginstore_list() != 44012) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_logins_checksum_method_loginstore_list_candidates() != 2252) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_record_breach_alert_dismissal() != 64238) {
@@ -3168,7 +3521,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_record_breach_alert_dismissal_time() != 38845) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_record_potentially_vulnerable_passwords() != 19976) {
+    if (uniffi_logins_checksum_method_loginstore_record_potentially_vulnerable_passwords() != 29285) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_register_with_sync_manager() != 13477) {
@@ -3180,7 +3533,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_reset_all_breaches() != 59640) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginstore_run_maintenance() != 53717) {
+    if (uniffi_logins_checksum_method_loginstore_run_maintenance() != 1723) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginstore_shutdown() != 50825) {
@@ -3195,7 +3548,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginstore_wipe_local() != 53422) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginsbridgedengine_apply() != 41329) {
+    if (uniffi_logins_checksum_method_loginstore_wipe_local_except_fxa() != 20250) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_logins_checksum_method_loginsbridgedengine_apply() != 46320) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginsbridgedengine_ensure_current_sync_id() != 41085) {
@@ -3207,22 +3563,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginsbridgedengine_reset() != 37044) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_logins_checksum_method_loginsbridgedengine_reset_last_sync() != 5595) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_logins_checksum_method_loginsbridgedengine_reset_sync_id() != 63879) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginsbridgedengine_set_last_sync() != 28145) {
+    if (uniffi_logins_checksum_method_loginsbridgedengine_set_uploaded() != 20129) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginsbridgedengine_set_uploaded() != 62228) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_logins_checksum_method_loginsbridgedengine_store_incoming() != 41331) {
+    if (uniffi_logins_checksum_method_loginsbridgedengine_store_incoming() != 510) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginsbridgedengine_sync_finished() != 4118) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_method_loginsbridgedengine_sync_id() != 41787) {
+    if (uniffi_logins_checksum_method_loginsbridgedengine_sync_id() != 39302) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_method_loginsbridgedengine_sync_started() != 40049) {
@@ -3231,10 +3587,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_logins_checksum_method_loginsbridgedengine_wipe() != 16170) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_constructor_loginstore_new() != 9176) {
+    if (uniffi_logins_checksum_constructor_loginstore_new() != 22780) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_logins_checksum_constructor_managedencryptordecryptor_new() != 21280) {
+    if (uniffi_logins_checksum_constructor_managedencryptordecryptor_new() != 6740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_logins_checksum_constructor_statickeymanager_new() != 3408) {
